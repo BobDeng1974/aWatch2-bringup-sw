@@ -56,7 +56,7 @@
 #include "ble_conn_params.h"
 #include "nrf_sdh.h"
 #include "nrf_sdh_ble.h"
-#include "boards.h"
+//#include "boards.h"
 #include "app_timer.h"
 #include "app_button.h"
 #include "ble_lbs.h"
@@ -66,16 +66,17 @@
 #include "nrf_drv_twi.h"
 #include "nrf_drv_spi.h"
 #include "nrf_drv_power.h"
+#include "nrf_drv_saadc.h"
 
 #include "nrf_log.h"
 #include "nrf_log_ctrl.h"
 #include "nrf_log_default_backends.h"
 
 
-#define ADVERTISING_LED                 BSP_BOARD_LED_0                         /**< Is on when device is advertising. */
-#define CONNECTED_LED                   BSP_BOARD_LED_1                         /**< Is on when device has connected. */
-#define LEDBUTTON_LED                   BSP_BOARD_LED_2                         /**< LED to be toggled with the help of the LED Button Service. */
-#define LEDBUTTON_BUTTON                NRF_GPIO_PIN_MAP(1,02)                  /**< Button that will trigger the notification event with the LED Button Service */
+#define BACK_BUTTON NRF_GPIO_PIN_MAP(1,01)
+#define UP_BUTTON   NRF_GPIO_PIN_MAP(1,02)
+#define CTR_BUTTON  NRF_GPIO_PIN_MAP(1,03)
+#define DOWN_BUTTON NRF_GPIO_PIN_MAP(1,04)
 
 #define DEVICE_NAME                     "aWatch2"                               /**< Name of device. Will be included in the advertising data. */
 
@@ -149,7 +150,7 @@ void assert_nrf_callback(uint16_t line_num, const uint8_t * p_file_name)
  */
 static void leds_init(void)
 {
-    bsp_board_init(BSP_INIT_LEDS);
+//    bsp_board_init(BSP_INIT_LEDS);
 }
 
 
@@ -373,7 +374,7 @@ static void advertising_start(void)
     err_code = sd_ble_gap_adv_start(m_adv_handle, APP_BLE_CONN_CFG_TAG);
     APP_ERROR_CHECK(err_code);
 
-    bsp_board_led_on(ADVERTISING_LED);
+//    bsp_board_led_on(ADVERTISING_LED);
 }
 
 
@@ -390,8 +391,8 @@ static void ble_evt_handler(ble_evt_t const * p_ble_evt, void * p_context)
     {
         case BLE_GAP_EVT_CONNECTED:
             NRF_LOG_INFO("Connected");
-            bsp_board_led_on(CONNECTED_LED);
-            bsp_board_led_off(ADVERTISING_LED);
+//            bsp_board_led_on(CONNECTED_LED);
+//            bsp_board_led_off(ADVERTISING_LED);
             m_conn_handle = p_ble_evt->evt.gap_evt.conn_handle;
             err_code = nrf_ble_qwr_conn_handle_assign(&m_qwr, m_conn_handle);
             APP_ERROR_CHECK(err_code);
@@ -401,7 +402,7 @@ static void ble_evt_handler(ble_evt_t const * p_ble_evt, void * p_context)
 
         case BLE_GAP_EVT_DISCONNECTED:
             NRF_LOG_INFO("Disconnected");
-            bsp_board_led_off(CONNECTED_LED);
+//            bsp_board_led_off(CONNECTED_LED);
             m_conn_handle = BLE_CONN_HANDLE_INVALID;
             err_code = app_button_disable();
             APP_ERROR_CHECK(err_code);
@@ -495,8 +496,17 @@ static void button_event_handler(uint8_t pin_no, uint8_t button_action)
 
     switch (pin_no)
     {
-        case LEDBUTTON_BUTTON:
-            NRF_LOG_INFO("Send button state change.");
+        case BACK_BUTTON:
+            NRF_LOG_INFO("back button %d", button_action);
+            break;
+        case UP_BUTTON:
+            NRF_LOG_INFO("up button %d", button_action);
+            break;
+        case DOWN_BUTTON:
+            NRF_LOG_INFO("down button %d", button_action);
+            break;
+        case CTR_BUTTON:
+            NRF_LOG_INFO("center button %d", button_action);
             err_code = ble_lbs_on_button_change(m_conn_handle, &m_lbs, button_action);
             if (err_code != NRF_SUCCESS &&
                 err_code != BLE_ERROR_INVALID_CONN_HANDLE &&
@@ -523,11 +533,15 @@ static void buttons_init(void)
     //The array must be static because a pointer to it will be saved in the button handler module.
     static app_button_cfg_t buttons[] =
     {
-        {LEDBUTTON_BUTTON, false, BUTTON_PULL, button_event_handler}
+        {BACK_BUTTON, false, NRF_GPIO_PIN_PULLUP, button_event_handler},
+        {UP_BUTTON, false, NRF_GPIO_PIN_PULLUP, button_event_handler},
+        {CTR_BUTTON, false, NRF_GPIO_PIN_PULLUP, button_event_handler},
+        {DOWN_BUTTON, false, NRF_GPIO_PIN_PULLUP, button_event_handler}
     };
 
     err_code = app_button_init(buttons, ARRAY_SIZE(buttons),
                                BUTTON_DETECTION_DELAY);
+    app_button_enable();
     APP_ERROR_CHECK(err_code);
 }
 
@@ -621,7 +635,7 @@ static void i2c_scan()
     }
 }
 
-static void i2c_init() 
+static void maxim_init() 
 {
     ret_code_t ret;
     const nrf_drv_twi_config_t config =
@@ -669,6 +683,72 @@ static void i2c_init()
     i2c_read(0x20, 0x40); /* BMM150 chipid should be 0x32 */
 
     return;
+}
+
+volatile static int saadc_is_done = 0;
+static void saadc_event_handler(nrfx_saadc_evt_t const *p_event)
+{
+    if (p_event->type == NRFX_SAADC_EVT_DONE || p_event->type == NRFX_SAADC_EVT_CALIBRATEDONE)
+        saadc_is_done = 1;
+}
+
+static void saadc_sample_one(uint8_t mon, const char *name, int ratio)
+{
+    ret_code_t ret;
+    
+    i2c_write(0x28, 0x1A, mon);
+
+    nrf_saadc_value_t val;
+    ret = nrfx_saadc_sample_convert(0, &val);
+    if (ret != NRF_SUCCESS) {
+        NRF_LOG_INFO("SAADC sample %d", ret);
+        return;
+    }
+
+    /* The floats are sinking! */
+    int mv = val * 600 * ratio / 0x3FFF;
+    
+    NRF_LOG_INFO("SAADC: %s (%02x): %d mV (%d raw)", name, mon, mv, val);
+    
+}
+
+static void saadc_test()
+{
+    ret_code_t ret;
+
+    nrfx_saadc_config_t config = NRFX_SAADC_DEFAULT_CONFIG;
+    config.resolution = NRF_SAADC_RESOLUTION_14BIT;
+    config.oversample = NRF_SAADC_OVERSAMPLE_DISABLED;
+    
+    ret = nrfx_saadc_init(&config, saadc_event_handler);
+    if (ret != NRF_SUCCESS) {
+        NRF_LOG_INFO("SAADC init %d", ret);
+        return;
+    }
+    
+    saadc_is_done = 0;
+    ret = nrfx_saadc_calibrate_offset();
+    if (ret != NRF_SUCCESS) {
+        NRF_LOG_INFO("SAADC calibrate %d", ret);
+        return;
+    }
+    while (!saadc_is_done)
+        ;
+    
+    nrf_saadc_channel_config_t chconf = NRFX_SAADC_DEFAULT_CHANNEL_CONFIG_SE(NRF_SAADC_INPUT_AIN1);
+    chconf.gain = NRF_SAADC_GAIN1_2;
+    chconf.acq_time = NRF_SAADC_ACQTIME_40US;
+
+    ret = nrfx_saadc_channel_init(0, &chconf);
+    if (ret != NRF_SUCCESS) {
+        NRF_LOG_INFO("SAADC channel %d", ret);
+        return;
+    }
+
+    saadc_sample_one(0x01, "BATT ", 8);
+    saadc_sample_one(0x02, "SYS  ", 8);
+    saadc_sample_one(0x04, "BUCK2", 8);
+    saadc_sample_one(0x05, "LDO1 ", 8);
 }
 
 static const nrf_drv_spi_t m_spi_master_1 = NRF_DRV_SPI_INSTANCE(1);
@@ -739,7 +819,8 @@ int main(void)
     conn_params_init();
 
     NRF_LOG_INFO("I2C init");
-    i2c_init();
+    maxim_init();
+    saadc_test();
     
     spi_init();
 
