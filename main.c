@@ -65,6 +65,7 @@
 #include "nrf_pwr_mgmt.h"
 #include "nrf_drv_twi.h"
 #include "nrf_drv_spi.h"
+#include "nrf_drv_qspi.h"
 #include "nrf_drv_power.h"
 #include "nrf_drv_saadc.h"
 #include "nrf_drv_pdm.h"
@@ -858,6 +859,73 @@ static void mic_test()
     NRF_LOG_INFO("PDM min %d %x, max %d %x", min, min, max, max);
 }
 
+#define BSP_QSPI_SCK_PIN 19
+#define BSP_QSPI_CSN_PIN 17
+#define BSP_QSPI_IO0_PIN 20
+#define BSP_QSPI_IO1_PIN 21
+#define BSP_QSPI_IO2_PIN 22
+#define BSP_QSPI_IO3_PIN 23
+
+static void qspi_test()
+{
+    nrfx_qspi_config_t config = NRF_DRV_QSPI_DEFAULT_CONFIG;
+    config.phy_if.sck_freq = NRF_QSPI_FREQ_32MDIV1;
+    config.pins.sck_pin = 19;
+    config.pins.csn_pin = 17;
+    config.pins.io0_pin = 20;
+    config.pins.io1_pin = 21;
+    config.pins.io2_pin = 22;
+    config.pins.io3_pin = 23;
+    
+    ret_code_t ret;
+    ret = nrfx_qspi_init(&config, NULL, NULL);
+    if (ret != NRF_SUCCESS) {
+        NRF_LOG_INFO("qspi init %d", ret);
+        return;
+    }
+    
+    nrf_qspi_cinstr_conf_t instr = NRFX_QSPI_DEFAULT_CINSTR(0x9F /* JEDEC ID */, 4);
+    uint8_t buf[16];
+    uint8_t golden[16] = {0xAA, 0x55, 0xF0, 0xF0, 0xEA, 0x80, 0xE0, 0xB3, 0x01, 0x23, 0x45, 0x67, 0x89, 0xAB, 0xCD, 0xEF};
+    ret = nrfx_qspi_cinstr_xfer(&instr, NULL, buf);
+    if (ret != NRF_SUCCESS) {
+        NRF_LOG_INFO("qspi jedec id %d", ret);
+        return;
+    }
+    NRF_LOG_INFO("QSPI: JEDEC ID %02x %02x %02x", buf[0], buf[1], buf[2]);
+    
+    instr.opcode = 0x35 /* read SR2 */;
+    instr.length = 2;
+    ret = nrfx_qspi_cinstr_xfer(&instr, NULL, buf);
+    if (ret != NRF_SUCCESS) {
+        NRF_LOG_INFO("qspi sr2 %d", ret);
+        return;
+    }
+    NRF_LOG_INFO("QSPI: SR2.QE = %d", !!(buf[0] & 2));
+    
+    ret = nrfx_qspi_read(buf, 16, 0);
+    if (ret != NRF_SUCCESS) {
+        NRF_LOG_INFO("qspi read %d", ret);
+        return;
+    }
+    if (memcmp(buf, golden, 16)) {
+        NRF_LOG_INFO("QSPI: writing at 0x0...");
+        ret = nrfx_qspi_erase(NRF_QSPI_ERASE_LEN_4KB, 0x0);
+        if (ret != NRF_SUCCESS) {
+            NRF_LOG_INFO("qspi erase %d", ret);
+            return;
+        }
+        
+        ret = nrfx_qspi_write(golden, 16, 0);
+        if (ret != NRF_SUCCESS) {
+            NRF_LOG_INFO("qspi write %d", ret);
+            return;
+        }
+    } else {
+        NRF_LOG_INFO("QSPI: readback matches golden");
+    }
+}
+
 /**@brief Function for application main entry.
  */
 int main(void)
@@ -878,8 +946,9 @@ int main(void)
     NRF_LOG_INFO("I2C init");
     maxim_init();
     saadc_test();
-    mic_test();
     spi_init();
+    qspi_test();
+    mic_test();
 
     // Start execution.
     NRF_LOG_INFO("aWatch2-bringup validation done");
