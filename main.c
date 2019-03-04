@@ -67,6 +67,7 @@
 #include "nrf_drv_spi.h"
 #include "nrf_drv_power.h"
 #include "nrf_drv_saadc.h"
+#include "nrf_drv_pdm.h"
 
 #include "nrf_log.h"
 #include "nrf_log_ctrl.h"
@@ -801,6 +802,62 @@ static void spi_init()
     }
 }
 
+static volatile int mic_ncap;
+#define MICBUFSIZ 32000
+static int16_t mic_buf[MICBUFSIZ];
+
+static void mic_event_handler(nrfx_pdm_evt_t const *const p_evt)
+{
+    NRF_LOG_INFO("PDM event, buffer request %d, compl bufr %p, error %d (%d left)", p_evt->buffer_requested, p_evt->buffer_released, p_evt->error, mic_ncap);
+    if (p_evt->buffer_requested)
+        nrfx_pdm_buffer_set(mic_buf, MICBUFSIZ);
+    if (p_evt->buffer_released) {
+        if (!mic_ncap) {
+            nrfx_pdm_stop();
+        } else
+            mic_ncap--;
+    }
+}
+
+
+static void mic_test()
+{
+    ret_code_t ret;
+    
+    /* mic power on */
+    nrf_gpio_cfg_output(2);
+    nrf_gpio_pin_set(2);
+    
+    nrfx_pdm_config_t config = NRFX_PDM_DEFAULT_CONFIG(1, 0);
+    config.edge = NRF_PDM_EDGE_LEFTRISING;
+    config.gain_l = NRF_PDM_GAIN_MAXIMUM;
+    config.gain_r = NRF_PDM_GAIN_MAXIMUM;
+    
+    ret = nrfx_pdm_init(&config, mic_event_handler);
+    if (ret != NRF_SUCCESS) {
+        NRF_LOG_INFO("pdm init %d", ret);
+        return;
+    }
+    
+    mic_ncap = 2;
+    NRF_LOG_INFO("capture start");
+    mic_buf[2000] = 444;
+    mic_buf[2001] = -555;
+    nrfx_pdm_start();
+    while (mic_ncap)
+        idle_state_handle();
+    NRF_LOG_INFO("capture end");
+    nrfx_pdm_stop();
+    
+    int16_t min = 0x7fff;
+    int16_t max = -0x7ffe;
+    for (int i = 0; i < MICBUFSIZ; i++) {
+        if (mic_buf[i] < min) min = mic_buf[i];
+        if (mic_buf[i] > max) max = mic_buf[i];
+    }
+    NRF_LOG_INFO("PDM min %d %x, max %d %x", min, min, max, max);
+}
+
 /**@brief Function for application main entry.
  */
 int main(void)
@@ -821,7 +878,7 @@ int main(void)
     NRF_LOG_INFO("I2C init");
     maxim_init();
     saadc_test();
-    
+    mic_test();
     spi_init();
 
     // Start execution.
