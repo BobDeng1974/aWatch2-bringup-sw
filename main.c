@@ -74,6 +74,10 @@
 #include "nrf_log_ctrl.h"
 #include "nrf_log_default_backends.h"
 
+#include "nrf_cli.h"
+#include "nrf_cli_types.h"
+#include "nrf_cli_uart.h"
+
 
 #define BACK_BUTTON NRF_GPIO_PIN_MAP(1,01)
 #define UP_BUTTON   NRF_GPIO_PIN_MAP(1,02)
@@ -556,6 +560,24 @@ static void log_init(void)
     NRF_LOG_DEFAULT_BACKENDS_INIT();
 }
 
+NRF_CLI_UART_DEF(m_cli_uart_transport, 0, 64, 16);
+NRF_CLI_DEF(m_cli_uart,
+            "Asterix# ",
+            &m_cli_uart_transport.transport,
+            '\r',
+            4);
+
+static void cli_init() {
+    ret_code_t ret;
+    
+    nrf_drv_uart_config_t uart_config = NRF_DRV_UART_DEFAULT_CONFIG;
+    uart_config.pseltxd = 8;
+    uart_config.pselrxd = 6;
+    uart_config.hwfc    = NRF_UART_HWFC_DISABLED;
+    ret = nrf_cli_init(&m_cli_uart, &uart_config, true, true, NRF_LOG_SEVERITY_INFO);
+    APP_ERROR_CHECK(ret);
+    
+}
 
 /**@brief Function for initializing power management.
  */
@@ -584,21 +606,21 @@ static void idle_state_handle(void)
 }
 
 
-static const nrf_drv_twi_t m_twi_master = NRF_DRV_TWI_INSTANCE(0);
+static const nrf_drv_twi_t i2c_pmic = NRF_DRV_TWI_INSTANCE(0);
+static const nrf_drv_twi_t i2c_sens = NRF_DRV_TWI_INSTANCE(1);
 
-
-static void i2c_read(uint8_t dev, uint8_t addr)
+static void i2c_read(const nrf_drv_twi_t *bus, uint8_t dev, uint8_t addr)
 {
     ret_code_t ret;
     uint8_t datum;
     
-    ret = nrf_drv_twi_tx(&m_twi_master, dev, &addr, 1, true);
+    ret = nrf_drv_twi_tx(bus, dev, &addr, 1, true);
     if (ret != NRF_SUCCESS) {
         NRF_LOG_INFO("twi tx %02x %d", dev, ret);
         return;
     }
     
-    ret = nrf_drv_twi_rx(&m_twi_master, dev, &datum, 1);
+    ret = nrf_drv_twi_rx(bus, dev, &datum, 1);
     if (ret != NRF_SUCCESS) {
         NRF_LOG_INFO("twi rx %d", ret);
         return;
@@ -607,7 +629,7 @@ static void i2c_read(uint8_t dev, uint8_t addr)
     NRF_LOG_INFO("%02x[%02x] = %02x", dev, addr, datum);
 }
 
-static void i2c_write(uint8_t dev, uint8_t addr, uint8_t datum)
+static void i2c_write(const nrf_drv_twi_t *bus, uint8_t dev, uint8_t addr, uint8_t datum)
 {
     ret_code_t ret;
     uint8_t data[2];
@@ -615,7 +637,7 @@ static void i2c_write(uint8_t dev, uint8_t addr, uint8_t datum)
     data[0] = addr;
     data[1] = datum;
     
-    ret = nrf_drv_twi_tx(&m_twi_master, dev, data, 2, false);
+    ret = nrf_drv_twi_tx(bus, dev, data, 2, false);
     if (ret != NRF_SUCCESS) {
         NRF_LOG_INFO("twi tx %02x %d", dev, ret);
         return;
@@ -624,68 +646,96 @@ static void i2c_write(uint8_t dev, uint8_t addr, uint8_t datum)
     NRF_LOG_INFO("%02x[%02x] <- %02x", dev, addr, datum);
 }
 
-static void i2c_scan()
+static void i2c_init()
 {
     ret_code_t ret;
-    
-    for (uint8_t i = 0; i != 0xFE; i++) {
-        uint8_t addr = 0;
-        ret = nrf_drv_twi_tx(&m_twi_master, i, &addr, 1, false);
-        if (ret != 33281) {
-            NRF_LOG_INFO("I2C device %02x ret %d", i, ret);
-        }
-    }
-}
-
-static void maxim_init() 
-{
-    ret_code_t ret;
-    const nrf_drv_twi_config_t config =
+    const nrf_drv_twi_config_t config_pmic =
     {
-#define TWI_MAXIM
-#ifdef TWI_MAXIM
        .scl                = 4,
        .sda                = 5,
-#else
-       .scl                = 27,
-       .sda                = 26,
-#endif
        .frequency          = NRF_DRV_TWI_FREQ_400K,
        .interrupt_priority = APP_IRQ_PRIORITY_HIGH,
        .clear_bus_init     = true
     };
 
-    ret = nrf_drv_twi_init(&m_twi_master, &config, NULL, NULL);
-
-    if (NRF_SUCCESS != ret)
+    ret = nrf_drv_twi_init(&i2c_pmic, &config_pmic, NULL, NULL);
+    APP_ERROR_CHECK(ret);
+    
+    const nrf_drv_twi_config_t config_sens =
     {
-        NRF_LOG_INFO("i2c init failed %d", ret);
+       .scl                = 27,
+       .sda                = 26,
+       .frequency          = NRF_DRV_TWI_FREQ_400K,
+       .interrupt_priority = APP_IRQ_PRIORITY_HIGH,
+       .clear_bus_init     = true
+    };
+
+    ret = nrf_drv_twi_init(&i2c_sens, &config_sens, NULL, NULL);
+    APP_ERROR_CHECK(ret);
+
+    nrf_drv_twi_enable(&i2c_pmic);
+    nrf_drv_twi_enable(&i2c_sens);
+
+}
+
+static void cmd_i2c(nrf_cli_t const * p_cli, size_t argc, char **argv)
+{
+    if ((argc != 4 && argc != 5) || nrf_cli_help_requested(p_cli)) {
+        nrf_cli_help_print(p_cli, NULL, 0);
         return;
     }
-
-    nrf_drv_twi_enable(&m_twi_master);
-
-(void)    i2c_scan;
-    i2c_read(0x28, 0x00); /* chipid maxim, 0x01 */
-    i2c_write(0x28, 0x1E, 0x81); /* Don't panic, little Maxim. */
-    i2c_write(0x28, 0x13, 0x19); /* LDO1 3.3v */
-    i2c_write(0x28, 0x12, 0x02); /* LDO1 enable */
-    i2c_write(0x28, 0x0F, 0xE8); /* Buck2 enable, burst mode, 2.2uH */
-    NRF_LOG_INFO("buck2 vset pre-set");
-    i2c_read(0x28, 0x10); /* buck2 vset  */
-    i2c_write(0x28, 0x10, 0x28); /* buck2, 2.8v */
-    NRF_LOG_INFO("buck2 vset post-set");
-    i2c_read(0x28, 0x10); /* buck2 vset  */
-    i2c_read(0x28, 0x13);
-    i2c_read(0x28, 0x12);
     
-    i2c_read(0x76, 0x00); /* BMP388 should be 0x50 */
-    i2c_read(0x68, 0x00); /* BMI160 chipid should be 0xD1 */
-    i2c_write(0x20, 0x4B, 0x01); /* power up */
-    i2c_read(0x20, 0x40); /* BMM150 chipid should be 0x32 */
+    const nrf_drv_twi_t *bus;
+    if (!strcmp(argv[1], "pmic"))
+        bus = &i2c_pmic;
+    else if (!strcmp(argv[1], "sens"))
+        bus = &i2c_sens;
+    else {
+        nrf_cli_help_print(p_cli, NULL, 0);
+        return;
+    }
+    
+    uint8_t dev = strtol(argv[2], NULL, 16);
+    uint8_t adr = strtol(argv[3], NULL, 16);
+    if (argc == 5) {
+        uint8_t data = strtol(argv[4], NULL, 16);
+        i2c_write(bus, dev, adr, data);
+    } else
+        i2c_read(bus, dev, adr);
+}
+NRF_CLI_CMD_REGISTER(i2c, NULL, "i2c [pmic|sens] dev adr [data]", cmd_i2c);
 
+
+static void pmic_init() 
+{
+    i2c_read(&i2c_pmic, 0x28, 0x00); /* chipid maxim, 0x01 */
+    i2c_write(&i2c_pmic, 0x28, 0x1E, 0x81); /* Don't panic, little Maxim. */
+    i2c_write(&i2c_pmic, 0x28, 0x13, 0x19); /* LDO1 3.3v */
+    i2c_write(&i2c_pmic, 0x28, 0x12, 0x02); /* LDO1 enable */
+    i2c_write(&i2c_pmic, 0x28, 0x0F, 0xE8); /* Buck2 enable, burst mode, 2.2uH */
+    i2c_write(&i2c_pmic, 0x28, 0x10, 0x28); /* buck2, 2.8v */
+    i2c_read(&i2c_pmic, 0x28, 0x13);
+    i2c_read(&i2c_pmic, 0x28, 0x12);
+    
     return;
 }
+
+static void cmd_sensor(nrf_cli_t const * p_cli, size_t argc, char **argv)
+{
+    NRF_LOG_INFO("Sensor test...");
+    /* Set up the IMU to power up the magnetometer */
+    i2c_write(&i2c_sens, 0x68, 0x7e /* command */, 0x19 /* mag power mode normal */);
+    i2c_read(&i2c_sens, 0x76, 0x00); /* BMP388 should be 0x50 */
+    i2c_read(&i2c_sens, 0x68, 0x00); /* BMI160 chipid should be 0xD1 */
+    i2c_read(&i2c_sens, 0x68, 0x03 /* PMU_STATUS */); /* hope [1:0] == 2'b01 */ 
+    i2c_write(&i2c_sens, 0x68, 0x4C /* MAG_IF[1] */, 0x80 /* MAG_MANUAL_EN */);
+    i2c_write(&i2c_sens, 0x68, 0x4F /* MAG_IF[4] */, 0x01 /* power on */);
+    i2c_write(&i2c_sens, 0x68, 0x4E /* MAG_IF[3] */, 0x4B /* magnetometer power control */);
+    i2c_write(&i2c_sens, 0x68, 0x4D /* MAG_IF[2] */, 0x40 /* BMM150 chipid */);
+    i2c_read(&i2c_sens, 0x68, 0x04 /* mag X data */); /* should be 0x32 */
+    i2c_read(&i2c_sens, 0x68, 0x1B /* mag X data */); /* should be 0x32 */
+}
+NRF_CLI_CMD_REGISTER(sensor, NULL, "Run sensor chipid tests.", cmd_sensor);
 
 volatile static int saadc_is_done = 0;
 static void saadc_event_handler(nrfx_saadc_evt_t const *p_event)
@@ -698,7 +748,7 @@ static void saadc_sample_one(uint8_t mon, const char *name, int ratio)
 {
     ret_code_t ret;
     
-    i2c_write(0x28, 0x1A, mon);
+    i2c_write(&i2c_pmic, 0x28, 0x1A, mon);
 
     nrf_saadc_value_t val;
     ret = nrfx_saadc_sample_convert(0, &val);
@@ -714,7 +764,7 @@ static void saadc_sample_one(uint8_t mon, const char *name, int ratio)
     
 }
 
-static void saadc_test()
+static void cmd_pmicmon(nrf_cli_t const * p_cli, size_t argc, char **argv)
 {
     ret_code_t ret;
 
@@ -752,14 +802,15 @@ static void saadc_test()
     saadc_sample_one(0x04, "BUCK2", 8);
     saadc_sample_one(0x05, "LDO1 ", 8);
 }
+NRF_CLI_CMD_REGISTER(pmicmon, NULL, "Display PMIC monitor voltages.", cmd_pmicmon);
 
-static const nrf_drv_spi_t m_spi_master_1 = NRF_DRV_SPI_INSTANCE(1);
+static const nrf_drv_spi_t m_spi_master_1 = NRF_DRV_SPI_INSTANCE(2);
 
 static const uint8_t rebble[] = {
 #include "rebble-bw.h"
 };
 
-static void spi_init()
+static void cmd_display(nrf_cli_t const * p_cli, size_t argc, char **argv)
 {
     ret_code_t ret;
 
@@ -802,6 +853,8 @@ static void spi_init()
         nrf_gpio_pin_clear(16);
     }
 }
+NRF_CLI_CMD_REGISTER(display, NULL, "Run display test.", cmd_display);
+
 
 static volatile int mic_ncap;
 #define MICBUFSIZ 32000
@@ -820,8 +873,7 @@ static void mic_event_handler(nrfx_pdm_evt_t const *const p_evt)
     }
 }
 
-
-static void mic_test()
+static void cmd_mic(nrf_cli_t const * p_cli, size_t argc, char **argv)
 {
     ret_code_t ret;
     
@@ -845,8 +897,10 @@ static void mic_test()
     mic_buf[2000] = 444;
     mic_buf[2001] = -555;
     nrfx_pdm_start();
-    while (mic_ncap)
+    while (mic_ncap) {
+        nrf_cli_process(&m_cli_uart);
         idle_state_handle();
+    }
     NRF_LOG_INFO("capture end");
     nrfx_pdm_stop();
     
@@ -858,6 +912,8 @@ static void mic_test()
     }
     NRF_LOG_INFO("PDM min %d %x, max %d %x", min, min, max, max);
 }
+NRF_CLI_CMD_REGISTER(mic, NULL, "Run mic test.", cmd_mic);
+
 
 #define BSP_QSPI_SCK_PIN 19
 #define BSP_QSPI_CSN_PIN 17
@@ -866,7 +922,7 @@ static void mic_test()
 #define BSP_QSPI_IO2_PIN 22
 #define BSP_QSPI_IO3_PIN 23
 
-static void qspi_test()
+static void cmd_qspi(nrf_cli_t const * p_cli, size_t argc, char **argv)
 {
     nrfx_qspi_config_t config = NRF_DRV_QSPI_DEFAULT_CONFIG;
     config.phy_if.sck_freq = NRF_QSPI_FREQ_32MDIV1;
@@ -892,7 +948,7 @@ static void qspi_test()
         NRF_LOG_INFO("qspi jedec id %d", ret);
         return;
     }
-    NRF_LOG_INFO("QSPI: JEDEC ID %02x %02x %02x", buf[0], buf[1], buf[2]);
+    NRF_LOG_INFO("QSPI: JEDEC ID %02x %02x %02x\n", buf[0], buf[1], buf[2]);
     
     instr.opcode = 0x35 /* read SR2 */;
     instr.length = 2;
@@ -901,7 +957,7 @@ static void qspi_test()
         NRF_LOG_INFO("qspi sr2 %d", ret);
         return;
     }
-    NRF_LOG_INFO("QSPI: SR2.QE = %d", !!(buf[0] & 2));
+    NRF_LOG_INFO("QSPI: SR2.QE = %d\n", !!(buf[0] & 2));
     
     ret = nrfx_qspi_read(buf, 16, 0);
     if (ret != NRF_SUCCESS) {
@@ -925,13 +981,20 @@ static void qspi_test()
         NRF_LOG_INFO("QSPI: readback matches golden");
     }
 }
+NRF_CLI_CMD_REGISTER(qspi, NULL, "Run QSPI test.", cmd_qspi);
+
 
 /**@brief Function for application main entry.
  */
 int main(void)
 {
     // Initialize.
+    cli_init();
     log_init();
+
+    nrf_gpio_cfg_output(13);
+    nrf_gpio_pin_set(13);
+
     leds_init();
     timers_init();
     buttons_init();
@@ -943,20 +1006,22 @@ int main(void)
     advertising_init();
     conn_params_init();
 
-    NRF_LOG_INFO("I2C init");
-    maxim_init();
-    saadc_test();
-    spi_init();
-    qspi_test();
-    mic_test();
+    i2c_init();
+    pmic_init();
 
     // Start execution.
-    NRF_LOG_INFO("aWatch2-bringup validation done");
+    NRF_LOG_INFO("hello from aWatch2");
     advertising_start();
+
+    ret_code_t ret = nrf_cli_start(&m_cli_uart);
+    APP_ERROR_CHECK(ret);
+    
+    nrf_gpio_pin_clear(13);
 
     // Enter main loop.
     for (;;)
     {
+        nrf_cli_process(&m_cli_uart);
         idle_state_handle();
     }
 }
